@@ -15,7 +15,24 @@ type metaVersion struct {
 	Created  string       `json:"created"` // RFC3339Nano UTC
 	State    VersionState `json:"state"`
 	PurgedAt string       `json:"purged_at,omitempty"`
+
+	// Retention state. All three fields are persisted in the manifest, so
+	// protection survives a process restart: bytes covered by an active
+	// retention can never be reclaimed merely because the process died and
+	// came back.
+	//
+	//	RetainUntil  RFC3339Nano deadline; the sentinel "permanent" means
+	//	             never-expiring. Empty string means no (current or past)
+	//	             retention was ever configured.
+	//	RetainReleasedAt is set when an active retention was explicitly
+	//	             released early; released data is reclaimed first under
+	//	             capacity pressure.
+	RetainUntil      string `json:"retain_until,omitempty"`
+	RetainReleasedAt string `json:"retain_released_at,omitempty"`
 }
+
+// retainPermanentSentinel marks a retention that never expires on its own.
+const retainPermanentSentinel = "permanent"
 
 // objectMeta holds the version history of one named object.
 type objectMeta struct {

@@ -30,23 +30,35 @@ type VerifyReport struct {
 // refSet classifies blob digests referenced by the current manifest.
 type refSet struct {
 	// referenced is digest -> true for every version that is active or
-	// soft-deleted (i.e. its bytes must remain readable).
+	// soft-deleted (i.e. its bytes must remain readable under the
+	// conservative policy).
 	referenced map[string]bool
 	// onlyDeleted is true for digests referenced exclusively by
-	// soft-deleted versions (eligible when SweepDeletedVersions is set).
+	// soft-deleted versions (potentially eligible for destructive GC).
 	onlyDeleted map[string]bool
+	// retained is true for digests touched by at least one version holding
+	// an active retention. Such bytes can never be reclaimed, regardless
+	// of GC policy or capacity pressure.
+	retained map[string]bool
 }
 
 // buildRefs computes the reference set from the live manifest. Callers
 // hold s.mu (snapshot reads while the mutex is held).
 func (s *Store) buildRefs() refSet {
-	rs := refSet{referenced: map[string]bool{}, onlyDeleted: map[string]bool{}}
+	rs := refSet{
+		referenced:  map[string]bool{},
+		onlyDeleted: map[string]bool{},
+		retained:    map[string]bool{},
+	}
 	activeRef := map[string]bool{}
 	deletedRef := map[string]bool{}
 	for _, obj := range s.manifest.Objects {
 		for _, mv := range obj.Versions {
 			if mv.State == StateCollected {
 				continue
+			}
+			if s.retentionActiveLocked(mv) {
+				rs.retained[mv.Digest] = true
 			}
 			if mv.State == StateDeleted {
 				deletedRef[mv.Digest] = true
@@ -64,6 +76,13 @@ func (s *Store) buildRefs() refSet {
 	return rs
 }
 
+// reclaimableDeletedLocked reports whether a soft-deleted-only digest may
+// physically be reclaimed: all of its references are soft-deleted and none
+// of them currently holds an active retention.
+func (s *Store) reclaimableDeletedLocked(rs refSet, digest string) bool {
+	return rs.onlyDeleted[digest] && !rs.retained[digest]
+}
+
 // computeStatsLocked gathers physical and logical usage. It does not
 // modify anything. Callers hold s.mu.
 func (s *Store) computeStatsLocked() Stats {
@@ -71,13 +90,13 @@ func (s *Store) computeStatsLocked() Stats {
 	blobSize := map[string]int64{}
 	_ = s.blobs.walkBlobs(func(digest string, size int64) error {
 		blobSize[digest] = size
+		st.OnDiskBytes += size
 		return nil
 	})
 	rs := s.buildRefs()
 
 	refBytes := map[string]int64{}
-	for name, obj := range s.manifest.Objects {
-		_ = name
+	for _, obj := range s.manifest.Objects {
 		if len(obj.Versions) > 0 {
 			st.Objects++
 		}
@@ -105,6 +124,9 @@ func (s *Store) computeStatsLocked() Stats {
 	for _, sz := range refBytes {
 		st.PhysicalBytes += sz
 	}
+	for d := range rs.retained {
+		st.RetainedBytes += blobSize[d]
+	}
 	for d, sz := range blobSize {
 		if !rs.referenced[d] {
 			st.OrphanBlobs++
@@ -113,15 +135,15 @@ func (s *Store) computeStatsLocked() Stats {
 	}
 	if s.opts.SweepDeletedVersions {
 		// Soft-deleted-only bytes are additionally reclaimable under the
-		// aggressive policy.
+		// aggressive policy, except for digests still covered by an active
+		// retention (which the conservative orphan pass never reaches).
 		added := map[string]bool{}
-		for _, obj := range s.manifest.Objects {
-			for _, mv := range obj.Versions {
-				if mv.State == StateDeleted && rs.onlyDeleted[mv.Digest] && !added[mv.Digest] {
-					added[mv.Digest] = true
-					st.ReclaimableBytes += blobSize[mv.Digest]
-				}
+		for d := range rs.onlyDeleted {
+			if rs.retained[d] || added[d] {
+				continue
 			}
+			added[d] = true
+			st.ReclaimableBytes += blobSize[d]
 		}
 	}
 	return st
@@ -158,13 +180,15 @@ func (s *Store) Sweep(ctx context.Context) (Stats, error) {
 		return Stats{}, err
 	}
 
-	// Phase 1: optionally downgrade soft-deleted-only versions.
+	// Phase 1: optionally downgrade soft-deleted-only versions. A digest is
+	// downgraded only when ALL of its references are soft-deleted and NONE
+	// of them currently holds an active retention.
 	if s.opts.SweepDeletedVersions {
 		rs := s.buildRefs()
 		changed := false
 		for _, obj := range s.manifest.Objects {
 			for _, mv := range obj.Versions {
-				if mv.State == StateDeleted && rs.onlyDeleted[mv.Digest] {
+				if mv.State == StateDeleted && s.reclaimableDeletedLocked(rs, mv.Digest) {
 					mv.State = StateCollected
 					if mv.PurgedAt == "" {
 						mv.PurgedAt = nowUTC()
@@ -207,6 +231,16 @@ func (s *Store) Sweep(ctx context.Context) (Stats, error) {
 	if err != nil {
 		// Even if deletion was interrupted, metadata remains consistent.
 		return s.computeStatsLocked(), err
+	}
+
+	// Phase 3: when a capacity watermark is configured, keep reclaiming
+	// soft-deleted versions (released, retention-expired, ordinary) until
+	// usage is at or below it. This is opt-in (MaxPhysicalBytes > 0) and is
+	// a no-op for the zero-value Options.
+	if s.opts.MaxPhysicalBytes > 0 {
+		if _, werr := s.sweepToWatermarkLocked(ctx); werr != nil {
+			return s.computeStatsLocked(), werr
+		}
 	}
 	return s.computeStatsLocked(), nil
 }

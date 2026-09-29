@@ -32,4 +32,17 @@ var (
 
 	// ErrName means an object name is invalid.
 	ErrName = errors.New("objectstore: invalid object name")
+
+	// ErrRetained means an operation was refused because the target version
+	// is currently protected by an active retention (a deadline still in the
+	// future or a permanent retention). Retained bytes can never be reclaimed
+	// until the retention expires or is explicitly released.
+	ErrRetained = errors.New("objectstore: version is under retention")
+
+	// ErrWatermark means physical usage could not be brought below the
+	// configured capacity watermark even after reclaiming every eligible
+	// (unreferenced / released / retention-expired / ordinary soft-deleted)
+	// version. No protected data was deleted: active versions and retained
+	// versions are always left intact.
+	ErrWatermark = errors.New("objectstore: physical usage still above watermark after reclaiming all eligible data")
 )
