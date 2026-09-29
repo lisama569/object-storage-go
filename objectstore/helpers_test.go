@@ -10,8 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // newTestStore opens a fresh store in a temp directory and registers
@@ -170,3 +172,37 @@ func stringsReader(s string) io.Reader { return strings.NewReader(s) }
 
 // atomicCAS flips a 0/1 int32 exactly once and reports whether it did.
 func atomicCAS(p *int32) bool { return atomic.CompareAndSwapInt32(p, 0, 1) }
+
+// fakeClock is a manually controlled time source for deterministic
+// retention-expiry tests.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock(start time.Time) *fakeClock { return &fakeClock{t: start.UTC()} }
+
+func (c *fakeClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) set(t time.Time) {
+	c.mu.Lock()
+	c.t = t.UTC()
+	c.mu.Unlock()
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// withFakeClock installs a controllable clock on a store and returns it.
+func withFakeClock(s *Store, start time.Time) *fakeClock {
+	c := newFakeClock(start)
+	s.now = c.now
+	return c
+}

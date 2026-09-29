@@ -24,6 +24,9 @@ type Store struct {
 	blobs    *blobStore
 	manifest *manifest
 	lock     *fileLock
+	// now is the time source. It defaults to time.Now in UTC; tests may
+	// replace it to exercise hold expiry deterministically.
+	now func() time.Time
 }
 
 const maxNameLen = 1024
@@ -51,6 +54,9 @@ func Open(ctx context.Context, dir string, opts Options) (*Store, error) {
 	}
 	if dir == "" {
 		return nil, fmt.Errorf("objectstore: empty directory")
+	}
+	if opts.WatermarkBytes < 0 {
+		return nil, fmt.Errorf("objectstore: negative WatermarkBytes %d", opts.WatermarkBytes)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create store dir: %w", err)
@@ -80,6 +86,7 @@ func Open(ctx context.Context, dir string, opts Options) (*Store, error) {
 		blobs:    blobs,
 		manifest: m,
 		lock:     lock,
+		now:      func() time.Time { return time.Now().UTC() },
 	}
 	// Reap any staging files left by a crash. This cannot touch data
 	// reachable from the manifest.
@@ -109,8 +116,9 @@ func (s *Store) Close() error {
 // nowUTC returns the current wall time as RFC3339Nano UTC.
 func nowUTC() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 
-// toInfo converts internal metadata into the public VersionInfo.
-func toInfo(name string, mv *metaVersion) VersionInfo {
+// toInfo converts internal metadata into the public VersionInfo,
+// including the currently-effective retention state. Callers hold s.mu.
+func (s *Store) toInfo(name string, mv *metaVersion) VersionInfo {
 	vi := VersionInfo{
 		Object:  name,
 		Version: mv.Version,
@@ -129,6 +137,12 @@ func toInfo(name string, mv *metaVersion) VersionInfo {
 		}
 	}
 	vi.Deleted = mv.State == StateDeleted
+	active, permanent, until := holdStateLocked(mv, s.now())
+	vi.Retained = active
+	vi.PermanentHold = permanent
+	if active && !permanent {
+		vi.RetainUntil = until
+	}
 	return vi
 }
 
@@ -204,7 +218,7 @@ func (s *Store) Put(ctx context.Context, name string, r io.Reader) (VersionInfo,
 		if err := ctx.Err(); err != nil {
 			return VersionInfo{}, err
 		}
-		return toInfo(name, cur), nil
+		return s.toInfo(name, cur), nil
 	}
 
 	version := obj.Next
@@ -232,9 +246,9 @@ func (s *Store) Put(ctx context.Context, name string, r io.Reader) (VersionInfo,
 		return VersionInfo{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return toInfo(name, mv), err
+		return s.toInfo(name, mv), err
 	}
-	return toInfo(name, mv), nil
+	return s.toInfo(name, mv), nil
 }
 
 // openVerified opens the blob for a resolved version and, unless read
@@ -267,7 +281,7 @@ func (s *Store) Get(ctx context.Context, name string) (io.ReadCloser, VersionInf
 	_, mv, err := s.lookupCurrentLocked(name)
 	info := VersionInfo{}
 	if mv != nil {
-		info = toInfo(name, mv)
+		info = s.toInfo(name, mv)
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -318,7 +332,7 @@ func (s *Store) GetVersion(ctx context.Context, name string, version int64) (io.
 	_, mv, err := s.lookupVersion(name, version)
 	info := VersionInfo{}
 	if mv != nil {
-		info = toInfo(name, mv)
+		info = s.toInfo(name, mv)
 	}
 	s.mu.Unlock()
 	if err != nil {
@@ -344,6 +358,11 @@ func (s *Store) Delete(ctx context.Context, name string) (VersionInfo, error) {
 	if err != nil {
 		return VersionInfo{}, err
 	}
+	// A live retention hold on the current version forbids hiding it via a
+	// soft delete; callers must release or let the hold expire first.
+	if active, _, _ := holdStateLocked(mv, s.now()); active {
+		return VersionInfo{}, fmt.Errorf("%w: %s v%d", ErrRetained, name, mv.Version)
+	}
 	// Object-level delete: hide the current pointer AND mark that exact
 	// version soft-deleted. DeletedCurrent lets Restore undo precisely
 	// this operation rather than guessing the nearest active version.
@@ -357,7 +376,7 @@ func (s *Store) Delete(ctx context.Context, name string) (VersionInfo, error) {
 		obj.DeletedCurrent = 0
 		return VersionInfo{}, err
 	}
-	return toInfo(name, mv), nil
+	return s.toInfo(name, mv), nil
 }
 
 // DeleteVersion marks a specific non-current version deleted. The
@@ -384,7 +403,10 @@ func (s *Store) DeleteVersion(ctx context.Context, name string, version int64) (
 		return VersionInfo{}, fmt.Errorf("%w: %s v%d", ErrCollected, name, version)
 	}
 	if mv.State == StateDeleted {
-		return toInfo(name, mv), nil
+		return s.toInfo(name, mv), nil
+	}
+	if active, _, _ := holdStateLocked(mv, s.now()); active {
+		return VersionInfo{}, fmt.Errorf("%w: %s v%d", ErrRetained, name, version)
 	}
 	mv.State = StateDeleted
 	if err := s.manifest.commit(s.root); err != nil {
@@ -392,9 +414,9 @@ func (s *Store) DeleteVersion(ctx context.Context, name string, version int64) (
 		return VersionInfo{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return toInfo(name, mv), err
+		return s.toInfo(name, mv), err
 	}
-	return toInfo(name, mv), nil
+	return s.toInfo(name, mv), nil
 }
 
 // Restore reverses an object-level soft delete. The newest active
@@ -415,7 +437,7 @@ func (s *Store) restoreLocked(ctx context.Context, name string) (VersionInfo, er
 		return VersionInfo{}, fmt.Errorf("%w: object %q", ErrNotFound, name)
 	}
 	if obj.Current != 0 {
-		return toInfo(name, obj.Versions[obj.Current]), nil
+		return s.toInfo(name, obj.Versions[obj.Current]), nil
 	}
 	// Prefer the exact version that Delete hid. It is currently in the
 	// Deleted state and Restore clears that. Fall back to the newest
@@ -448,9 +470,9 @@ func (s *Store) restoreLocked(ctx context.Context, name string) (VersionInfo, er
 		return VersionInfo{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return toInfo(name, targetMV), err
+		return s.toInfo(name, targetMV), err
 	}
-	return toInfo(name, targetMV), nil
+	return s.toInfo(name, targetMV), nil
 }
 
 // RestoreVersion clears the soft-deleted state of one specific version.
@@ -474,7 +496,7 @@ func (s *Store) RestoreVersion(ctx context.Context, name string, version int64) 
 		return VersionInfo{}, fmt.Errorf("%w: %s v%d", ErrCollected, name, version)
 	}
 	if mv.State == StateActive {
-		return toInfo(name, mv), nil
+		return s.toInfo(name, mv), nil
 	}
 	prevCurrent := obj.Current
 	mv.State = StateActive
@@ -487,9 +509,9 @@ func (s *Store) RestoreVersion(ctx context.Context, name string, version int64) 
 		return VersionInfo{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return toInfo(name, mv), err
+		return s.toInfo(name, mv), err
 	}
-	return toInfo(name, mv), nil
+	return s.toInfo(name, mv), nil
 }
 
 // PurgeVersion physically reclaims one version's data.
@@ -521,28 +543,38 @@ func (s *Store) PurgeVersion(ctx context.Context, name string, version int64) (V
 		return VersionInfo{}, fmt.Errorf("%w: %s v%d", ErrNotFound, name, version)
 	}
 	if mv.State == StateCollected {
-		return toInfo(name, mv), nil
+		return s.toInfo(name, mv), nil
+	}
+	// Retention wins over reclamation: an unexpired/permanent hold rejects
+	// PurgeVersion with ErrRetained; once expired it is purgeable normally.
+	if active, _, _ := holdStateLocked(mv, s.now()); active {
+		return VersionInfo{}, fmt.Errorf("%w: %s v%d", ErrRetained, name, version)
 	}
 	digest := mv.Digest
 	prevState := mv.State
+	prevPerm, prevUntil := mv.RetainPermanent, mv.RetainUntil
 	mv.State = StateCollected
 	mv.PurgedAt = nowUTC()
+	// Collected data has no bytes and therefore no hold to keep.
+	mv.RetainPermanent = false
+	mv.RetainUntil = ""
 	if err := s.manifest.commit(s.root); err != nil {
 		mv.State = prevState
 		mv.PurgedAt = ""
+		mv.RetainPermanent, mv.RetainUntil = prevPerm, prevUntil
 		return VersionInfo{}, err
 	}
 	if !s.digestReferencedLocked(digest, func(v *metaVersion) bool {
 		return v.State != StateCollected
 	}) {
 		if err := s.blobs.remove(digest); err != nil {
-			return toInfo(name, mv), err
+			return s.toInfo(name, mv), err
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return toInfo(name, mv), err
+		return s.toInfo(name, mv), err
 	}
-	return toInfo(name, mv), nil
+	return s.toInfo(name, mv), nil
 }
 
 // digestReferencedLocked reports whether any version (across all
@@ -576,7 +608,7 @@ func (s *Store) Versions(ctx context.Context, name string) ([]VersionInfo, error
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	out := make([]VersionInfo, 0, len(ids))
 	for _, v := range ids {
-		out = append(out, toInfo(name, obj.Versions[v]))
+		out = append(out, s.toInfo(name, obj.Versions[v]))
 	}
 	return out, nil
 }

@@ -35,12 +35,22 @@ type refSet struct {
 	// onlyDeleted is true for digests referenced exclusively by
 	// soft-deleted versions (eligible when SweepDeletedVersions is set).
 	onlyDeleted map[string]bool
+	// held is digest -> true when at least one non-collected version
+	// currently under an effective retention hold references the digest.
+	// Such blobs must never be reclaimed while the hold is active; even a
+	// soft-deleted co-referer sharing the bytes keeps them alive.
+	held map[string]bool
 }
 
 // buildRefs computes the reference set from the live manifest. Callers
 // hold s.mu (snapshot reads while the mutex is held).
 func (s *Store) buildRefs() refSet {
-	rs := refSet{referenced: map[string]bool{}, onlyDeleted: map[string]bool{}}
+	now := s.now()
+	rs := refSet{
+		referenced:  map[string]bool{},
+		onlyDeleted: map[string]bool{},
+		held:        map[string]bool{},
+	}
 	activeRef := map[string]bool{}
 	deletedRef := map[string]bool{}
 	for _, obj := range s.manifest.Objects {
@@ -54,6 +64,9 @@ func (s *Store) buildRefs() refSet {
 				activeRef[mv.Digest] = true
 			}
 			rs.referenced[mv.Digest] = true
+			if active, _, _ := holdStateLocked(mv, now); active {
+				rs.held[mv.Digest] = true
+			}
 		}
 	}
 	for d := range deletedRef {
@@ -71,13 +84,14 @@ func (s *Store) computeStatsLocked() Stats {
 	blobSize := map[string]int64{}
 	_ = s.blobs.walkBlobs(func(digest string, size int64) error {
 		blobSize[digest] = size
+		st.DiskBytes += size
 		return nil
 	})
 	rs := s.buildRefs()
+	now := s.now()
 
 	refBytes := map[string]int64{}
-	for name, obj := range s.manifest.Objects {
-		_ = name
+	for _, obj := range s.manifest.Objects {
 		if len(obj.Versions) > 0 {
 			st.Objects++
 		}
@@ -89,6 +103,9 @@ func (s *Store) computeStatsLocked() Stats {
 				st.DeletedVersions++
 			case StateCollected:
 				st.CollectedVersion++
+			}
+			if active, _, _ := holdStateLocked(mv, now); active {
+				st.RetainedVersions++
 			}
 			if mv.State != StateCollected {
 				// Logical usage counts every readable version (so shared
@@ -105,25 +122,24 @@ func (s *Store) computeStatsLocked() Stats {
 	for _, sz := range refBytes {
 		st.PhysicalBytes += sz
 	}
+	// Soft-deleted-only bytes are reclaimable either under the aggressive
+	// Sweep policy or when a watermark needs space, but a digest that any
+	// retained version still references is never reclaimable.
+	softReclaimPolicy := s.opts.SweepDeletedVersions || s.opts.WatermarkBytes > 0
+	softAdded := map[string]bool{}
 	for d, sz := range blobSize {
 		if !rs.referenced[d] {
 			st.OrphanBlobs++
 			st.ReclaimableBytes += sz
+			continue
+		}
+		if softReclaimPolicy && rs.onlyDeleted[d] && !rs.held[d] && !softAdded[d] {
+			softAdded[d] = true
+			st.ReclaimableBytes += sz
 		}
 	}
-	if s.opts.SweepDeletedVersions {
-		// Soft-deleted-only bytes are additionally reclaimable under the
-		// aggressive policy.
-		added := map[string]bool{}
-		for _, obj := range s.manifest.Objects {
-			for _, mv := range obj.Versions {
-				if mv.State == StateDeleted && rs.onlyDeleted[mv.Digest] && !added[mv.Digest] {
-					added[mv.Digest] = true
-					st.ReclaimableBytes += blobSize[mv.Digest]
-				}
-			}
-		}
-	}
+	st.WatermarkBytes = s.opts.WatermarkBytes
+	st.OverWatermark = s.opts.WatermarkBytes > 0 && st.DiskBytes > s.opts.WatermarkBytes
 	return st
 }
 
@@ -158,17 +174,21 @@ func (s *Store) Sweep(ctx context.Context) (Stats, error) {
 		return Stats{}, err
 	}
 
-	// Phase 1: optionally downgrade soft-deleted-only versions.
+	// Phase 1: optionally downgrade soft-deleted-only versions. A digest
+	// referenced by any retained version is excluded even when every
+	// reference is soft-deleted: the hold wins over the aggressive policy.
 	if s.opts.SweepDeletedVersions {
 		rs := s.buildRefs()
 		changed := false
 		for _, obj := range s.manifest.Objects {
 			for _, mv := range obj.Versions {
-				if mv.State == StateDeleted && rs.onlyDeleted[mv.Digest] {
+				if mv.State == StateDeleted && rs.onlyDeleted[mv.Digest] && !rs.held[mv.Digest] {
 					mv.State = StateCollected
 					if mv.PurgedAt == "" {
 						mv.PurgedAt = nowUTC()
 					}
+					mv.RetainPermanent = false
+					mv.RetainUntil = ""
 					changed = true
 				}
 			}
@@ -207,6 +227,18 @@ func (s *Store) Sweep(ctx context.Context) (Stats, error) {
 	if err != nil {
 		// Even if deletion was interrupted, metadata remains consistent.
 		return s.computeStatsLocked(), err
+	}
+
+	// Phase 3: when a watermark is configured, reclaim just enough
+	// soft-deleted, unretained data to drive DiskBytes back to the mark.
+	// Active and retained versions are never touched; if the level still
+	// cannot be reached, ErrWatermarkExceeded is returned explicitly.
+	if s.opts.WatermarkBytes > 0 {
+		st, werr := s.enforceWatermarkLocked(ctx)
+		if werr != nil {
+			return st, werr
+		}
+		return st, nil
 	}
 	return s.computeStatsLocked(), nil
 }

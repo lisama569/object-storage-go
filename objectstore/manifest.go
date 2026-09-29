@@ -15,6 +15,12 @@ type metaVersion struct {
 	Created  string       `json:"created"` // RFC3339Nano UTC
 	State    VersionState `json:"state"`
 	PurgedAt string       `json:"purged_at,omitempty"`
+	// RetainPermanent marks an unexpiring retention (legal) hold.
+	RetainPermanent bool `json:"retain_permanent,omitempty"`
+	// RetainUntil is the RFC3339Nano UTC expiry of a timed hold; empty
+	// means no timed hold. A past instant is an expired timed hold, which
+	// no longer protects the version.
+	RetainUntil string `json:"retain_until,omitempty"`
 }
 
 // objectMeta holds the version history of one named object.

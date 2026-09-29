@@ -23,6 +23,17 @@ var (
 	// is the current live version (for example purging it).
 	ErrCurrent = errors.New("objectstore: cannot purge current version")
 
+	// ErrRetained means a destructive operation was refused because the
+	// version is protected by an active retention hold (a timed hold that
+	// has not expired, or a permanent hold). Reading is unaffected.
+	ErrRetained = errors.New("objectstore: version is under retention")
+
+	// ErrWatermarkExceeded means a watermark-driven reclaim pass removed
+	// everything safely reclaimable (orphans, expired/unheld soft-deleted
+	// data) but total disk usage is still above the configured mark. No
+	// protected or active data was deleted to force the level down.
+	ErrWatermarkExceeded = errors.New("objectstore: disk usage still exceeds watermark after reclaim")
+
 	// ErrLocked means another process already has the store open.
 	ErrLocked = errors.New("objectstore: store is locked by another process")
 
