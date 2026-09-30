@@ -21,6 +21,14 @@ import (
 func newTestStore(t *testing.T, opts Options) (*Store, string) {
 	t.Helper()
 	dir := t.TempDir()
+	return newTestStoreAt(t, dir, opts), dir
+}
+
+// newTestStoreAt opens a store at the given (already chosen) directory and
+// registers close cleanup. It is used by tests that need the path before
+// opening to manipulate directory permissions.
+func newTestStoreAt(t *testing.T, dir string, opts Options) *Store {
+	t.Helper()
 	ctx := context.Background()
 	s, err := Open(ctx, dir, opts)
 	if err != nil {
@@ -31,7 +39,7 @@ func newTestStore(t *testing.T, opts Options) (*Store, string) {
 			t.Logf("Close error: %v", err)
 		}
 	})
-	return s, dir
+	return s
 }
 
 // digestOf mirrors the content address used by the store.

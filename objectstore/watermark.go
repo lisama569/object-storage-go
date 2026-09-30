@@ -6,25 +6,59 @@ import (
 	"sort"
 )
 
+// reclaimTier orders eligible soft-deleted data. The lower the number,
+// the earlier the group is sacrificed when a watermark needs space.
+const (
+	// tierReleased: the last effective hold was explicitly removed early
+	// via ReleaseRetention. Its protection was deliberately lifted, so it
+	// goes before data that merely aged out.
+	tierReleased = 0
+	// tierExpired: a timed hold ended naturally at its expiry instant;
+	// nobody actively released it.
+	tierExpired = 1
+	// tierNeverHeld: data that never had any retention hold.
+	tierNeverHeld = 2
+)
+
 // reclaimGroup is one blob digest plus every soft-deleted, unretained
 // version that references it. Collecting the group frees exactly one
 // blob (dedup: one physical file may back several logical versions).
 type reclaimGroup struct {
 	digest  string
 	size    int64
-	oldest  string // smallest Created of the members: reclaim priority key
+	tier    int    // reclaim priority class (see reclaimTier constants)
+	oldest  string // smallest Created of the members: tie break within a tier
 	members []*metaVersion
+}
+
+// reclaimTierLocked classifies one currently-unprotected, soft-deleted
+// version for watermark reclaim ordering. Callers hold s.mu.
+func reclaimTierLocked(mv *metaVersion) int {
+	switch {
+	case mv.RetainReleasedAt != "":
+		return tierReleased
+	case mv.RetainUntil != "" || mv.RetainPermanent:
+		return tierExpired
+	default:
+		return tierNeverHeld
+	}
 }
 
 // enforceWatermarkLocked drives DiskBytes down to Options.WatermarkBytes
 // using only data that is safe to sacrifice: orphan blobs are removed
 // first (already handled by Sweep phase 2), then soft-deleted versions
 // whose retention is absent or expired are collected in deterministic
-// priority order (oldest first). Active versions and retained versions
-// are never reclaimed. If every safe byte is reclaimed and usage is
-// still above the mark, ErrWatermarkExceeded is returned; metadata and
-// bytes stay self-consistent at every intermediate step. Callers hold
-// s.mu.
+// priority order:
+//
+//  1. versions whose hold was explicitly released early, then
+//  2. versions whose timed hold expired naturally, then
+//  3. versions that never had a hold,
+//
+// each class ordered oldest-first (digest breaks ties). Active versions
+// and retained versions are never reclaimed. If every safe byte is
+// reclaimed and usage is still above the mark, ErrWatermarkExceeded is
+// returned; metadata and bytes stay self-consistent at every intermediate
+// step. Callers hold s.mu.
 func (s *Store) enforceWatermarkLocked(ctx context.Context) (Stats, error) {
 	mark := s.opts.WatermarkBytes
 
@@ -79,13 +113,19 @@ func (s *Store) enforceWatermarkLocked(ctx context.Context) (Stats, error) {
 			if !rs.onlyDeleted[mv.Digest] || rs.held[mv.Digest] {
 				continue
 			}
+			tier := reclaimTierLocked(mv)
 			g := groups[mv.Digest]
 			if g == nil {
-				g = &reclaimGroup{digest: mv.Digest, size: blobSize[mv.Digest], oldest: mv.Created}
+				g = &reclaimGroup{digest: mv.Digest, size: blobSize[mv.Digest], tier: tier, oldest: mv.Created}
 				if g.size == 0 {
 					g.size = mv.Size
 				}
 				groups[mv.Digest] = g
+			}
+			// A shared group is sacrificed as early as its most
+			// deliberately-releasable member.
+			if tier < g.tier {
+				g.tier = tier
 			}
 			if mv.Created < g.oldest || g.oldest == "" {
 				g.oldest = mv.Created
@@ -98,9 +138,14 @@ func (s *Store) enforceWatermarkLocked(ctx context.Context) (Stats, error) {
 	for _, g := range groups {
 		ordered = append(ordered, g)
 	}
-	// Deterministic priority: oldest soft-deleted data first; digest breaks
-	// ties so repeated runs pick exactly the same victims.
+	// Deterministic priority: explicitly released first, then naturally
+	// expired, then never-held; within a class the oldest soft-deleted
+	// data goes first and digest breaks ties, so repeated runs pick
+	// exactly the same victims.
 	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].tier != ordered[j].tier {
+			return ordered[i].tier < ordered[j].tier
+		}
 		if ordered[i].oldest != ordered[j].oldest {
 			return ordered[i].oldest < ordered[j].oldest
 		}
@@ -117,22 +162,41 @@ func (s *Store) enforceWatermarkLocked(ctx context.Context) (Stats, error) {
 		if err := ctx.Err(); err != nil {
 			return s.computeStatsLocked(), err
 		}
+		// Snapshot the fields we overwrite so a failed commit restores the
+		// in-memory manifest to exactly the durable state.
+		type prev struct {
+			mv                                     *metaVersion
+			state                                  VersionState
+			purgedAt, permUntil, until, releasedAt string
+			permanent                              bool
+		}
+		snaps := make([]prev, 0, len(g.members))
 		for _, mv := range g.members {
+			snaps = append(snaps, prev{
+				mv:         mv,
+				state:      mv.State,
+				purgedAt:   mv.PurgedAt,
+				permanent:  mv.RetainPermanent,
+				permUntil:  mv.RetainUntil,
+				releasedAt: mv.RetainReleasedAt,
+			})
 			mv.State = StateCollected
 			if mv.PurgedAt == "" {
 				mv.PurgedAt = nowUTC()
 			}
 			mv.RetainPermanent = false
 			mv.RetainUntil = ""
+			mv.RetainReleasedAt = ""
 		}
 		if err := s.manifest.commit(s.root); err != nil {
 			// Commit failed: durable state is unchanged, so restore the
 			// in-memory snapshot to match and abort with nothing reclaimed.
-			for _, mv := range g.members {
-				mv.State = StateDeleted
-				mv.PurgedAt = ""
-				mv.RetainPermanent = false
-				mv.RetainUntil = ""
+			for _, sn := range snaps {
+				sn.mv.State = sn.state
+				sn.mv.PurgedAt = sn.purgedAt
+				sn.mv.RetainPermanent = sn.permanent
+				sn.mv.RetainUntil = sn.permUntil
+				sn.mv.RetainReleasedAt = sn.releasedAt
 			}
 			return Stats{}, err
 		}

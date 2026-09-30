@@ -55,17 +55,25 @@ func (s *Store) Retain(ctx context.Context, name string, version int64, until ti
 	case requestPermanent:
 		mv.RetainPermanent = true
 		mv.RetainUntil = ""
+		mv.RetainReleasedAt = ""
 		changed = true
 	case active && oldUntil.After(until):
 		// Existing timed hold already outlives the request: keep it.
+	case active && oldUntil.Equal(until):
+		// The request asks for exactly the hold already in place: this must
+		// be a true no-op, so no manifest commit (and no disk write) happens.
 	default:
+		// No active hold, or the request strictly extends the current one:
+		// this is the only case that strengthens protection. A fresh hold
+		// also clears any record of an earlier explicit release.
 		mv.RetainUntil = until.Format(time.RFC3339Nano)
+		mv.RetainReleasedAt = ""
 		changed = true
 	}
 	if changed {
-		prevPerm, prevUntil := mv.RetainPermanent, mv.RetainUntil
+		prevPerm, prevUntil, prevReleased := mv.RetainPermanent, mv.RetainUntil, mv.RetainReleasedAt
 		if err := s.manifest.commit(s.root); err != nil {
-			mv.RetainPermanent, mv.RetainUntil = prevPerm, prevUntil
+			mv.RetainPermanent, mv.RetainUntil, mv.RetainReleasedAt = prevPerm, prevUntil, prevReleased
 			return RetentionInfo{}, err
 		}
 	}
@@ -103,12 +111,17 @@ func (s *Store) ReleaseRetention(ctx context.Context, name string, version int64
 	}
 
 	now := s.now()
-	if mv.RetainPermanent || mv.RetainUntil != "" {
-		prevPerm, prevUntil := mv.RetainPermanent, mv.RetainUntil
+	// Only an *effective* hold is something ReleaseRetention actually
+	// changes: releasing a version that never had a hold, or whose hold
+	// already expired, is a side-effect-free no-op (in particular the
+	// "released early" marker must not be stamped onto an expired hold).
+	if active, _, _ := holdStateLocked(mv, now); active {
+		prevPerm, prevUntil, prevReleased := mv.RetainPermanent, mv.RetainUntil, mv.RetainReleasedAt
 		mv.RetainPermanent = false
 		mv.RetainUntil = ""
+		mv.RetainReleasedAt = now.Format(time.RFC3339Nano)
 		if err := s.manifest.commit(s.root); err != nil {
-			mv.RetainPermanent, mv.RetainUntil = prevPerm, prevUntil
+			mv.RetainPermanent, mv.RetainUntil, mv.RetainReleasedAt = prevPerm, prevUntil, prevReleased
 			return RetentionInfo{}, err
 		}
 	}

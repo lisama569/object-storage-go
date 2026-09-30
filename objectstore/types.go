@@ -90,11 +90,13 @@ type Options struct {
 	SweepDeletedVersions bool
 	// WatermarkBytes, when > 0, sets a high-water mark on the total size
 	// of committed blob files. Sweep then reclaims in deterministic
-	// priority order (orphan blobs first, then oldest soft-deleted data
-	// whose retention is absent or expired) until DiskBytes is at or below
-	// the mark. Active versions and retained versions are never reclaimed.
-	// If everything safely reclaimable has been reclaimed and usage is
-	// still above the mark, Sweep returns ErrWatermarkExceeded. Zero (the
-	// default) disables watermark enforcement entirely.
+	// priority order (orphan blobs first, then soft-deleted data whose
+	// hold was explicitly released early, then data whose hold expired
+	// naturally, then data that never had a hold; oldest first within
+	// each class) until DiskBytes is at or below the mark. Active
+	// versions and retained versions are never reclaimed. If everything
+	// safely reclaimable has been reclaimed and usage is still above the
+	// mark, Sweep returns ErrWatermarkExceeded. Zero (the default)
+	// disables watermark enforcement entirely.
 	WatermarkBytes int64
 }

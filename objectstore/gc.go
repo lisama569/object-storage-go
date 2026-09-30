@@ -189,6 +189,7 @@ func (s *Store) Sweep(ctx context.Context) (Stats, error) {
 					}
 					mv.RetainPermanent = false
 					mv.RetainUntil = ""
+					mv.RetainReleasedAt = ""
 					changed = true
 				}
 			}

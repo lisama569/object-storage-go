@@ -128,10 +128,17 @@ data, _ := io.ReadAll(rc)
 
 不会出现"静默返回旧内容/部分内容"。
 
-**加入保留功能后，拒绝原因仍然严格可区分**：被保留的软删版本读取仍是
-`ErrDeleted`（数据在盘、状态是删除）；保留只拦截"让数据可能消失"的操作并返回
-`ErrRetained`，绝不拦截读；解除保留并被回收后读才变成 `ErrCollected`，不会被
-降级报成 `ErrNotFound`。
+**加入保留功能后，拒绝原因仍然严格可区分**：
+
+- 一个**先被软删、之后又加了保留**的版本（典型的审计留档快照），读取
+  仍然失败，但返回的错误**同时**满足 `errors.Is(err, ErrDeleted)` 和
+  `errors.Is(err, ErrRetained)`——调用方既能知道"数据在盘、可恢复"，也能
+  单独判断出"它目前还在保留保护期内"。这一区分来自 `manifest.json` 的持久
+  字段，**进程重启后依旧成立**。保留到期或被 `ReleaseRetention` 提前解除后，
+  同一读取只剩 `ErrDeleted` 一个原因。
+- 普通软删（从未加过保留）的版本读取只匹配 `ErrDeleted`，绝不会误报保留；
+  保留只拦截"让数据可能消失"的操作并返回 `ErrRetained`，绝不拦截读；解除保留
+  并被回收后读才变成 `ErrCollected`，不会被降级报成 `ErrNotFound`。
 
 ---
 
@@ -162,12 +169,25 @@ PermanentHold / RetainUntil`。
 
 - **只增不减（extend-only）**：`Retain` 只会加强保留——永久保留不会被限期请求
   缩短；限期保留的截止时间只会取"现有截止时间与请求截止时间的较晚者"。
-  因此**对同一版本重复设置相同（或更弱）的保留要求不会产生任何副作用**，也不会
-  多产生一次 manifest 提交。
+- **重复/更弱请求是真正的空操作（无任何落盘副作用）**：对同一版本
+  - 永久保留再设永久、用更短期限去覆盖永久；
+  - 限期保留再设**完全相同**的截止时间、或设置更早（更短）的截止时间；
+
+  这些调用都会直接成功返回，**不会触发一次 manifest 提交、磁盘上的
+  `manifest.json` 不会被重写**（可以用文件 mtime 观察到它不变）。把存储目录
+  设成不可写后重复这类请求仍然成功；只有真正需要**延长或加强**（例如把限期
+  延长到更晚、给没有有效保留的版本首次加保留、过期后重新加保留、从限期升级为
+  永久）时才发生恰好一次原子提交。提交失败会回滚内存状态。
 - **到期自动失效**：截止时刻到达（`now >= Until`）后保留即不再生效，无需手工
   清理；记录保留在元数据中但查询返回 `Retained=false`。
+- **`ReleaseRetention` 只解除"正在生效"的保留**：对从未加过保留、或保留已经
+  自然过期的版本调用它同样是无落盘的空操作——不会给一条已过期记录盖上"提前
+  解除"的标记。提前解除会在元数据中持久记录解除时刻（`retain_released_at`），
+  该记录用于水位回收的优先级判定（见第 6 节）；之后对该版本重新 `Retain`、或
+  版本被物理回收时会清除它。
 - **可以保留软删版本**：对已经 `Deleted` 的版本加保留也是允许的（典型的"审计
-  快照"）。此时读取仍按软删返回 `ErrDeleted`，但它的字节任何 Sweep 都不能删；
+  快照"）。此时读取仍按软删拒绝，但错误**同时**匹配 `ErrDeleted` 与
+  `ErrRetained`（见第 4 节），它的字节任何 Sweep 都不能删；
   `RestoreVersion` 后即可正常读。
 - **保留拦截什么**：有效期内，`Delete`（current 被保留时）、`DeleteVersion`、
   `PurgeVersion`、以及保守/激进/水位三种 Sweep 的回收，全部被拒绝或跳过；
@@ -175,9 +195,10 @@ PermanentHold / RetainUntil`。
 - **不能给已回收版本加保留**：`StateCollected` 的版本返回 `ErrCollected`；
   未知对象/版本返回 `ErrNotFound`。
 - **崩溃安全与重启持久化**：保留状态是 `manifest.json` 里每个版本的字段
-  （`retain_permanent` / `retain_until`），沿用"写临时文件 → fsync → rename →
-  fsync 目录"的原子提交。保留/解除在提交完成前不生效，提交完成后**进程重启保护
-  不消失**；提交失败会把内存状态回滚，绝不会出现"保护丢了但调用方以为在"。
+  （`retain_permanent` / `retain_until` / `retain_released_at`），沿用"写临时
+  文件 → fsync → rename → fsync 目录"的原子提交。保留/解除在提交完成前不生效，
+  提交完成后**进程重启保护不消失**；提交失败会把内存状态回滚，绝不会出现"保护
+  丢了但调用方以为在"。
 - **fail-closed**：万一磁盘上的截止时间字段无法解析，按"仍在保留"处理，宁可
   多保护也不误删。
 
@@ -196,12 +217,21 @@ PermanentHold / RetainUntil`。
 
 1. **先清真正无引用的 blob**（崩溃写入残留、已被 `PurgeVersion` 释放的 blob
    等）——这是常规 Sweep 的第 2 阶段，任何水位配置下都先做；
-2. 还不够时，按**最老优先**回收"软删且当前**不受保留**"的版本：
-   - 依据各候选版本的创建时间（`Created`）从旧到新，digest 作为确定性
-     tiebreak；重复执行选出的牺牲者完全相同。
+2. 还不够时，回收"软删且当前**不受保留**"的版本。候选数据按**它上一段保留是
+   怎么结束的**分三个优先级类别，类别编号小的先被回收；**类别先于年龄**——
+   只要类别更靠前，哪怕它更新也先回收：
+   1. **保留被 `ReleaseRetention` 提前解除**的数据（保护是被人为主动撤掉的，
+      最先可牺牲；持久字段 `retain_released_at` 记录解除时刻，重启后仍然区分
+      得出）；
+   2. **限期保留自然过期**的数据（没人主动解除，只是时间到了）；
+   3. **本来就没有引用**保留、从未加过保留的软删数据。
+   同一类别内部再按各候选版本的创建时间（`Created`）从旧到新，digest 作为确定
+   性 tiebreak；重复执行选出的牺牲者完全相同。
    - 每个候选组（同一 digest 的所有软删无保留版本）遵循
-     **先原子提交元数据（标 `Collected`）、再删 blob** 的崩溃安全顺序；
-   - **一旦占用回到水位线立即停止**，不会多删"更新"的软删数据。
+     **先原子提交元数据（标 `Collected`）、再删 blob** 的崩溃安全顺序；组的类别
+     取组内成员"最靠前"的类别（共享同一 blob 的任一成员更早可牺牲，整组就更早
+     回收）；
+   - **一旦占用回到水位线立即停止**，不会多删"更新/更不该动"的软删数据。
 3. 无论空间多紧张，两类数据**永远不会被牺牲**：
    - 处于有效保留期或永久保留的版本（以及与它们共享同一 blob 的任何版本）；
    - 当前还能正常读到的数据（`Active` 版本，含 current）。
@@ -298,7 +328,8 @@ blob 被清掉，任何时刻都不存在悬空引用。`context` 在边界处�
 - **零值 `Options{}` 的行为与旧版本完全一致**：不启用水位、不启用激进回收，
   `Sweep` 只删真正无引用的 blob；保留 API 未被调用时所有版本等价于"无保留"。
 - **旧 `manifest.json` 直接可读**：新增的 `retain_permanent` / `retain_until`
-  字段均为 `omitempty`，旧文件缺省即"无保留"，无需迁移。
+  / `retain_released_at` 字段均为 `omitempty`，旧文件缺省即"无保留"（在水位
+  回收中归入"从未保留"类别），无需迁移。
 - 新字段只是 `Stats`/`VersionInfo` 的**追加字段**，旧调用方不受影响；
 - 新错误 `ErrRetained`、`ErrWatermarkExceeded` 只在**显式使用**新能力（设置
   保留 / 设置水位）时才可能出现，原有错误分类（`ErrNotFound / ErrDeleted /
@@ -326,15 +357,23 @@ go test -race -count=5 ./...   # 竞态检测 + 重复运行，验证稳定性
 - 版本历史、软删/恢复的精确语义、删除后再写复活；
 - 三类拒绝原因可区分（`ErrNotFound / ErrDeleted / ErrCollected`）与
   `ErrCurrent / ErrLocked / ErrName` 边界；
-- **保留：永久/限期设置、extend-only 续期与重复设置幂等、提前解除、到期失效、
-  重启后保留仍在并继续拦截 purge（`TestRetainPermanentAndTimed`、
-  `TestRetainSurvivesRestart`、`TestReleaseAndExpiry`、`TestRetainBlocksDelete`、
+- **保留：永久/限期设置、extend-only 续期与重复设置幂等（含"无 manifest
+  落盘"与只读目录验证）、提前解除、到期失效、重启后保留仍在并继续拦截 purge
+  （`TestRetainPermanentAndTimed`、`TestRetainIdempotentNoDiskWrite`、
+  `TestRetainExtendOnlyAfterExpiry`、`TestRetainSurvivesRestart`、
+  `TestReleaseAndExpiry`、`TestRetainBlocksDelete`、
   `TestRetainOnDeletedVersion`）**；
-- **水位：超线时按"先孤儿 blob、再最老软删"顺序精确回收到线、受保留与可读
-  数据绝不牺牲、压不下去时显式 `ErrWatermarkExceeded`、低于水位时保持保守、
-  重复回收收敛（`TestWatermarkReclaimsInPriorityOrder`、
-  `TestWatermarkNeverTouchesRetainedAndActive`、`TestWatermarkNoOpWhenBelowMark`、
-  `TestWatermarkRepeatedSweepStable`）**；
+- **软删后加保留的版本，读取错误同时匹配 `ErrDeleted` 与 `ErrRetained`，
+  普通/过期/解除后只剩 `ErrDeleted`，且重启后区分依旧
+  （`TestReadDeletedRetainedVersionDistinguishesHold`）**；
+- **水位：超线时按"先孤儿 blob、再提前解除保留、再自然过期、再从未保留的软删"
+  的确定顺序精确回收到线（类别优先于年龄）、受保留与可读数据绝不牺牲、压不下去
+  时显式 `ErrWatermarkExceeded`、低于水位时保持保守、重复回收收敛
+  （`TestWatermarkReclaimsInPriorityOrder`、
+  `TestWatermarkReclaimOrderReleasedBeforeExpired`、
+  `TestWatermarkReclaimTierOrderFull`、
+  `TestWatermarkNeverTouchesRetainedAndActive`、
+  `TestWatermarkNoOpWhenBelowMark`、`TestWatermarkRepeatedSweepStable`）**；
 - **回收中断（元数据已提交、blob 未删）后重开继续完成、无悬空引用
   （`TestWatermarkInterruptedRestart`）；`context` 取消后零修改、重跑收敛
   （`TestSweepHonorsCancellation`）**；
@@ -355,7 +394,7 @@ go test -race -count=5 ./...   # 竞态检测 + 重复运行，验证稳定性
 // 永久保留某个审计版本；重启后仍然有效
 store.Retain(ctx, "report/2026-Q2", 3, time.Time{})
 
-// 限期保留到 2026-12-31，重复/缩短调用不会削弱已有保留
+// 限期保留到 2026-12-31，重复/缩短调用不会削弱已有保留，也不会重写 manifest
 store.Retain(ctx, "report/2026-Q2", 3, time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC))
 
 // 查询 / 列出 / 提前解除

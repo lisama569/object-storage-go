@@ -3,6 +3,7 @@ package objectstore
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -167,7 +168,16 @@ func (s *Store) lookupVersion(name string, version int64) (*objectMeta, *metaVer
 	case StateCollected:
 		return obj, mv, fmt.Errorf("%w: %s v%d", ErrCollected, name, version)
 	case StateDeleted:
-		return obj, mv, fmt.Errorf("%w: %s v%d", ErrDeleted, name, version)
+		err := fmt.Errorf("%w: %s v%d", ErrDeleted, name, version)
+		// A soft-deleted version still under retention is refused for two
+		// independently observable reasons: the caller sees ErrDeleted (the
+		// bytes are on disk and the version is restorable), and the same
+		// error also matches ErrRetained so an audit/retention reader can
+		// tell the data is additionally hold-protected.
+		if active, _, _ := holdStateLocked(mv, s.now()); active {
+			err = errors.Join(err, fmt.Errorf("%w: hold still in effect on %s v%d", ErrRetained, name, version))
+		}
+		return obj, mv, err
 	}
 	return obj, mv, nil
 }
@@ -317,7 +327,14 @@ func (s *Store) lookupCurrentLocked(name string) (*objectMeta, *metaVersion, err
 		case mv.State == StateCollected:
 			return obj, mv, fmt.Errorf("%w: %s", ErrCollected, name)
 		default:
-			return obj, mv, fmt.Errorf("%w: %s", ErrDeleted, name)
+			err := fmt.Errorf("%w: %s", ErrDeleted, name)
+			// Mirror GetVersion: a tombstoned current version still under
+			// retention additionally matches ErrRetained so callers can
+			// distinguish "deleted and hold-protected" from plain deletion.
+			if active, _, _ := holdStateLocked(mv, s.now()); active {
+				err = errors.Join(err, fmt.Errorf("%w: hold still in effect on %s", ErrRetained, name))
+			}
+			return obj, mv, err
 		}
 	}
 	return s.lookupVersion(name, obj.Current)
@@ -552,16 +569,17 @@ func (s *Store) PurgeVersion(ctx context.Context, name string, version int64) (V
 	}
 	digest := mv.Digest
 	prevState := mv.State
-	prevPerm, prevUntil := mv.RetainPermanent, mv.RetainUntil
+	prevPerm, prevUntil, prevReleased := mv.RetainPermanent, mv.RetainUntil, mv.RetainReleasedAt
 	mv.State = StateCollected
 	mv.PurgedAt = nowUTC()
 	// Collected data has no bytes and therefore no hold to keep.
 	mv.RetainPermanent = false
 	mv.RetainUntil = ""
+	mv.RetainReleasedAt = ""
 	if err := s.manifest.commit(s.root); err != nil {
 		mv.State = prevState
 		mv.PurgedAt = ""
-		mv.RetainPermanent, mv.RetainUntil = prevPerm, prevUntil
+		mv.RetainPermanent, mv.RetainUntil, mv.RetainReleasedAt = prevPerm, prevUntil, prevReleased
 		return VersionInfo{}, err
 	}
 	if !s.digestReferencedLocked(digest, func(v *metaVersion) bool {
