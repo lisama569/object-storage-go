@@ -118,9 +118,10 @@ data, _ := io.ReadAll(rc)
 |------|------|
 | `ErrNotFound` | 对象/版本从未存在 |
 | `ErrDeleted` | 版本存在但被软删，数据仍在、可恢复 |
+| `ErrDeletedRetained` | 版本既被软删、**又仍在有效保留期内**（典型审计留档）；同时可用 `errors.Is` 匹配 `ErrDeleted` 与 `ErrRetained` |
 | `ErrCollected` | 版本已被物理回收，不可恢复 |
 | `ErrCurrent` | 试图 purge 当前版本 |
-| `ErrRetained` | 版本处于有效保留期（或永久保留），删除/回收被拒绝 |
+| `ErrRetained` | 版本处于有效保留期（或永久保留），删除/回收被拒绝；读取软删且保留中的版本时也会作为组合原因出现 |
 | `ErrWatermarkExceeded` | 水位回收已把所有"可安全牺牲"的数据清完，占用仍高于水位线 |
 | `ErrDigestMismatch` | 读到的数据与内容地址不符（损坏/截断） |
 | `ErrLocked` | 另一进程已打开该目录 |
@@ -128,10 +129,14 @@ data, _ := io.ReadAll(rc)
 
 不会出现"静默返回旧内容/部分内容"。
 
-**加入保留功能后，拒绝原因仍然严格可区分**：被保留的软删版本读取仍是
-`ErrDeleted`（数据在盘、状态是删除）；保留只拦截"让数据可能消失"的操作并返回
-`ErrRetained`，绝不拦截读；解除保留并被回收后读才变成 `ErrCollected`，不会被
-降级报成 `ErrNotFound`。
+**加入保留功能后，拒绝原因仍然严格可区分**：被保留的软删版本读取返回
+`ErrDeletedRetained`——它是 `ErrDeleted` 与 `ErrRetained` 的组合错误，调用方既
+可以继续用 `errors.Is(err, ErrDeleted)`（数据在盘、状态是删除、可
+`RestoreVersion`），也可以用 `errors.Is(err, ErrRetained)` 单独看出"它其实还在
+保留保护期内"，还能精确匹配 `ErrDeletedRetained`。保留解除或到期但版本仍处于
+软删时，读取回到单纯的 `ErrDeleted`；之后被回收读才变成 `ErrCollected`，不会被
+降级报成 `ErrNotFound`。该区分完全来自持久化元数据（`retain_permanent` /
+`retain_until`），**进程重启后结论不变**。
 
 ---
 
@@ -145,7 +150,7 @@ data, _ := io.ReadAll(rc)
 | 方法 | 语义 |
 |------|------|
 | `Retain(ctx, name, v, until)` | 给版本 `v` 设置保留。`until` 为零值 `time.Time{}` 表示**永久保留**；否则是一个 **UTC 截止时刻**（必须晚于当前时间）。 |
-| `ReleaseRetention(ctx, name, v)` | **提前解除**保留（永久/限期均可）。本来就没有有效保留时是空操作。 |
+| `ReleaseRetention(ctx, name, v)` | **提前解除**保留（永久/限期均可）。只有对**当前正在生效**的保留才会落盘并记录"提前解除"；对已经自然过期或本来就没有保留的版本调用是**不落盘的空操作**（保留"自然过期"这一事实，供水位回收排序使用）。 |
 | `Retention(ctx, name, v)` | 查询单个版本当前的保留状态。 |
 | `ListRetained(ctx, name)` | 列出某对象当前所有**正在生效**的保留，按版本号排序；已过期的不出现。 |
 
@@ -160,24 +165,37 @@ PermanentHold / RetainUntil`。
 
 关键规则：
 
-- **只增不减（extend-only）**：`Retain` 只会加强保留——永久保留不会被限期请求
-  缩短；限期保留的截止时间只会取"现有截止时间与请求截止时间的较晚者"。
-  因此**对同一版本重复设置相同（或更弱）的保留要求不会产生任何副作用**，也不会
-  多产生一次 manifest 提交。
+- **只增不减（extend-only）与真正的幂等落盘语义**：`Retain` 只会加强保留——永久
+  保留不会被限期请求缩短；限期保留的截止时间只会取"现有截止时间与请求截止时间的
+  较晚者"。因此以下请求**在判定不需要加强后直接成功返回，不会尝试任何 manifest
+  提交，也不触碰磁盘**：
+  - 永久保留再设永久；
+  - 对永久保留下发限期请求（更弱）；
+  - 限期保留重复下发**完全相同**的截止时间；
+  - 用更短的期限去覆盖更长的期限（更弱）。
+  只有确定要**延长或加强**（限期更长、限期升级为永久、或此前无有效保留）时才落盘。
+  这不是"写了但内容没变"：把存储目录设为只读，重复/更弱请求依旧成功，只有真正加强
+  的请求才会因写盘失败而报错。
 - **到期自动失效**：截止时刻到达（`now >= Until`）后保留即不再生效，无需手工
   清理；记录保留在元数据中但查询返回 `Retained=false`。
 - **可以保留软删版本**：对已经 `Deleted` 的版本加保留也是允许的（典型的"审计
-  快照"）。此时读取仍按软删返回 `ErrDeleted`，但它的字节任何 Sweep 都不能删；
-  `RestoreVersion` 后即可正常读。
+  快照"）。此时读取返回 `ErrDeletedRetained`（同时匹配 `ErrDeleted` 与
+  `ErrRetained`，见第 4 节），它的字节任何 Sweep 都不能删；`RestoreVersion`
+  后即可正常读。
+- **提前解除与自然过期是两种不同状态**：`ReleaseRetention` 对生效中的保留落盘
+  解除，并在元数据中置 `retain_released` 标记；限期保留自己到期则不产生该标记。
+  二者都让版本"不再受保护"，但水位回收时先后顺序不同（见第 6 节）。之后若再次
+  `Retain`，该标记清除。
 - **保留拦截什么**：有效期内，`Delete`（current 被保留时）、`DeleteVersion`、
   `PurgeVersion`、以及保守/激进/水位三种 Sweep 的回收，全部被拒绝或跳过；
   破坏性操作显式返回 `ErrRetained`。**读永远不受保留影响。**
 - **不能给已回收版本加保留**：`StateCollected` 的版本返回 `ErrCollected`；
   未知对象/版本返回 `ErrNotFound`。
 - **崩溃安全与重启持久化**：保留状态是 `manifest.json` 里每个版本的字段
-  （`retain_permanent` / `retain_until`），沿用"写临时文件 → fsync → rename →
-  fsync 目录"的原子提交。保留/解除在提交完成前不生效，提交完成后**进程重启保护
-  不消失**；提交失败会把内存状态回滚，绝不会出现"保护丢了但调用方以为在"。
+  （`retain_permanent` / `retain_until` / `retain_released`），沿用"写临时文件
+  → fsync → rename → fsync 目录"的原子提交。保留/解除在提交完成前不生效，提交
+  完成后**进程重启保护不消失**；提交失败会把内存状态回滚，绝不会出现"保护丢了
+  但调用方以为在"。
 - **fail-closed**：万一磁盘上的截止时间字段无法解析，按"仍在保留"处理，宁可
   多保护也不误删。
 
@@ -196,12 +214,17 @@ PermanentHold / RetainUntil`。
 
 1. **先清真正无引用的 blob**（崩溃写入残留、已被 `PurgeVersion` 释放的 blob
    等）——这是常规 Sweep 的第 2 阶段，任何水位配置下都先做；
-2. 还不够时，按**最老优先**回收"软删且当前**不受保留**"的版本：
-   - 依据各候选版本的创建时间（`Created`）从旧到新，digest 作为确定性
-     tiebreak；重复执行选出的牺牲者完全相同。
-   - 每个候选组（同一 digest 的所有软删无保留版本）遵循
-     **先原子提交元数据（标 `Collected`）、再删 blob** 的崩溃安全顺序；
-   - **一旦占用回到水位线立即停止**，不会多删"更新"的软删数据。
+2. 还不够时，回收**软删且当前不受保留**的版本，按下面的**固定层级**依次取，
+   层内按各候选版本的创建时间（`Created`）从旧到新，digest 作为最终确定性
+   tiebreak；重复执行选出的牺牲者完全相同：
+   1. **保留被提前解除的**（对生效中的保留调用过 `ReleaseRetention`，
+      `retain_released=true`）——约定中"已经解除保留"的数据最先腾；
+   2. **保留自然过期的**（限期保留到期、未做过提前解除）；
+   3. **本来就没有引用的软删版本**（从未加过保留直接软删的）。
+   同一 digest 被多个软删版本共享时，整组按其中**最弱（层级号最大）**的成员定位：
+   只要还有一个共享者位于更后层级，该 blob 就不会被提前牺牲。
+   每个候选组遵循**先原子提交元数据（标 `Collected`）、再删 blob** 的崩溃安全
+   顺序；**一旦占用回到水位线立即停止**，不会多删更后层级的数据。
 3. 无论空间多紧张，两类数据**永远不会被牺牲**：
    - 处于有效保留期或永久保留的版本（以及与它们共享同一 blob 的任何版本）；
    - 当前还能正常读到的数据（`Active` 版本，含 current）。
@@ -289,7 +312,7 @@ blob 被清掉，任何时刻都不存在悬空引用。`context` 在边界处�
 |------|------|------|
 | `DisableReadVerification` | `false`（即默认校验） | 置 `true` 关闭读取时再哈希校验（仅在你用其它方式保证完整性时使用） |
 | `SweepDeletedVersions` | `false`（保守） | 置 `true` 后 `Sweep` 会把"仅被软删版本引用且不受保留"的数据也物理回收，并把这些版本转为不可逆的 `Collected` |
-| `WatermarkBytes` | `0`（关闭） | 正数启用容量水位：`Sweep` 自动按"先无引用 blob、再最老的无保留软删数据"的确定顺序把 `DiskBytes` 压到该值以下；`Active` 与受保留数据绝不牺牲，压不下去时返回 `ErrWatermarkExceeded`。负数在 `Open` 时报错 |
+| `WatermarkBytes` | `0`（关闭） | 正数启用容量水位：`Sweep` 自动按"先无引用 blob、再提前解除保留、再自然过期、最后从未保留的软删数据"的确定顺序把 `DiskBytes` 压到该值以下；`Active` 与受保留数据绝不牺牲，压不下去时返回 `ErrWatermarkExceeded`。负数在 `Open` 时报错 |
 
 其余常量（如流式拷贝缓冲大小 `stageBufSize`、对象名长度上限）在源码顶部定义。
 
@@ -297,12 +320,14 @@ blob 被清掉，任何时刻都不存在悬空引用。`context` 在边界处�
 
 - **零值 `Options{}` 的行为与旧版本完全一致**：不启用水位、不启用激进回收，
   `Sweep` 只删真正无引用的 blob；保留 API 未被调用时所有版本等价于"无保留"。
-- **旧 `manifest.json` 直接可读**：新增的 `retain_permanent` / `retain_until`
-  字段均为 `omitempty`，旧文件缺省即"无保留"，无需迁移。
+- **旧 `manifest.json` 直接可读**：新增的 `retain_permanent` / `retain_until` /
+  `retain_released` 字段均为 `omitempty`，旧文件缺省即"无保留、未提前解除"，
+  无需迁移。
 - 新字段只是 `Stats`/`VersionInfo` 的**追加字段**，旧调用方不受影响；
-- 新错误 `ErrRetained`、`ErrWatermarkExceeded` 只在**显式使用**新能力（设置
-  保留 / 设置水位）时才可能出现，原有错误分类（`ErrNotFound / ErrDeleted /
-  ErrCollected / ErrCurrent`）的边界保持不变。
+- 新错误 `ErrRetained`、`ErrWatermarkExceeded`、`ErrDeletedRetained` 只在
+  **显式使用**新能力（设置保留 / 设置水位 / 软删后加保留）时才可能出现；
+  `ErrDeletedRetained` 同时匹配 `ErrDeleted` 与 `ErrRetained`，原有错误分类
+  （`ErrNotFound / ErrDeleted / ErrCollected / ErrCurrent`）的边界保持不变。
 
 ---
 
@@ -330,9 +355,17 @@ go test -race -count=5 ./...   # 竞态检测 + 重复运行，验证稳定性
   重启后保留仍在并继续拦截 purge（`TestRetainPermanentAndTimed`、
   `TestRetainSurvivesRestart`、`TestReleaseAndExpiry`、`TestRetainBlocksDelete`、
   `TestRetainOnDeletedVersion`）**；
-- **水位：超线时按"先孤儿 blob、再最老软删"顺序精确回收到线、受保留与可读
-  数据绝不牺牲、压不下去时显式 `ErrWatermarkExceeded`、低于水位时保持保守、
-  重复回收收敛（`TestWatermarkReclaimsInPriorityOrder`、
+- **重复/更弱保留请求真正零落盘（manifest mtime/内容不变、只读目录下仍成功，
+  只有真正加强才写盘）（`TestRetainIdempotentNoDiskSideEffect`）**；
+- **软删后加保留的读取可单独区分保留原因：精确匹配 `ErrDeletedRetained` 且同时
+  匹配 `ErrDeleted`/`ErrRetained`，解除/过期后回到单纯 `ErrDeleted`，重启后依旧
+  （`TestDeletedRetainedReadReasonDistinct`、
+  `TestReadRejectionReasonsStayDistinct`）**；
+- **水位：超线时按"先孤儿 blob、再提前解除、再自然过期、最后从未保留的软删"固定
+  层级顺序精确回收到线、同层最老优先 digest 兜底、受保留与可读数据绝不牺牲、压不
+  下去时显式 `ErrWatermarkExceeded`、低于水位时保持保守、重复回收收敛
+  （`TestWatermarkReclaimsInPriorityOrder`、
+  `TestWatermarkReleasedBeforeExpiredOrder`、`TestWatermarkTierOrderFullSequence`、
   `TestWatermarkNeverTouchesRetainedAndActive`、`TestWatermarkNoOpWhenBelowMark`、
   `TestWatermarkRepeatedSweepStable`）**；
 - **回收中断（元数据已提交、blob 未删）后重开继续完成、无悬空引用
@@ -355,15 +388,23 @@ go test -race -count=5 ./...   # 竞态检测 + 重复运行，验证稳定性
 // 永久保留某个审计版本；重启后仍然有效
 store.Retain(ctx, "report/2026-Q2", 3, time.Time{})
 
-// 限期保留到 2026-12-31，重复/缩短调用不会削弱已有保留
+// 限期保留到 2026-12-31；重复相同截止时间、用更短期限覆盖、对永久保留下发限期
+// 都直接成功返回且不产生任何落盘；只有更长的期限或升级为永久才会写盘
 store.Retain(ctx, "report/2026-Q2", 3, time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC))
 
-// 查询 / 列出 / 提前解除
+// 软删后加保留（审计留档）：读取原因可单独区分
+_, _, err = store.GetVersion(ctx, "report/2026-Q2", 3)
+errors.Is(err, objectstore.ErrDeletedRetained) // 精确：软删且仍在保留期
+errors.Is(err, objectstore.ErrDeleted)         // 同时成立：数据在盘、可恢复
+errors.Is(err, objectstore.ErrRetained)        // 同时成立：保留仍在保护
+
+// 查询 / 列出 / 提前解除（提前解除的版本在水位回收时排在自然过期之前）
 ri, _ := store.Retention(ctx, "report/2026-Q2", 3)
 held, _ := store.ListRetained(ctx, "report/2026-Q2")
 store.ReleaseRetention(ctx, "report/2026-Q2", 3)
 
-// 100 MiB 水位：超线时 Sweep 自动腾空间；压不下去返回 ErrWatermarkExceeded
+// 100 MiB 水位：超线时 Sweep 按"无引用 → 提前解除 → 自然过期 → 从未保留"腾空间；
+// 受保留/Active 数据绝不牺牲，压不下去返回 ErrWatermarkExceeded
 s, _ := objectstore.Open(ctx, dir, objectstore.Options{WatermarkBytes: 100 << 20})
 st, err := s.Sweep(ctx) // st.DiskBytes / st.OverWatermark 说明结果
 ```

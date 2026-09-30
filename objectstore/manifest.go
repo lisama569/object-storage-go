@@ -21,6 +21,13 @@ type metaVersion struct {
 	// means no timed hold. A past instant is an expired timed hold, which
 	// no longer protects the version.
 	RetainUntil string `json:"retain_until,omitempty"`
+	// RetainReleased records that an *active* hold was explicitly lifted
+	// early via ReleaseRetention, as opposed to a timed hold expiring on
+	// its own. It is meaningful only while no hold is currently active and
+	// drives watermark reclaim priority (early-released data is reclaimed
+	// before naturally-expired data). Placing a new hold clears it; the
+	// field is omitempty so older manifests read back as "never released".
+	RetainReleased bool `json:"retain_released,omitempty"`
 }
 
 // objectMeta holds the version history of one named object.

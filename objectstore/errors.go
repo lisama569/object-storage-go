@@ -14,6 +14,17 @@ var (
 	// (soft delete). The data is still on disk and the version can be restored.
 	ErrDeleted = errors.New("objectstore: version is deleted")
 
+	// ErrDeletedRetained classifies a read of a version that is soft-deleted
+	// AND simultaneously protected by an active retention hold (the typical
+	// audit-archive case: deleted first, retained afterwards). It is a join
+	// of ErrDeleted and ErrRetained, so callers keep working with either
+	// errors.Is(err, ErrDeleted) (the bytes are present and restorable) or
+	// errors.Is(err, ErrRetained) (the version is still inside its hold),
+	// while callers that need to tell the two situations apart can match
+	// ErrDeletedRetained exactly. The classification is persisted metadata
+	// and therefore identical after a restart.
+	ErrDeletedRetained = errors.Join(ErrDeleted, ErrRetained)
+
 	// ErrCollected means the version was explicitly purged or reclaimed by
 	// garbage collection. Its metadata entry is retained for history but the
 	// data can never be read or restored again.

@@ -48,39 +48,53 @@ func (s *Store) Retain(ctx context.Context, name string, version int64, until ti
 	}
 
 	active, permanent, oldUntil := holdStateLocked(mv, now)
-	changed := false
 	switch {
-	case permanent:
-		// Already the strongest possible hold: nothing to do.
+	case requestPermanent && permanent:
+		// Identical permanent hold repeated: no-op, no commit.
+	case !requestPermanent && permanent:
+		// A weaker timed request can never shorten a permanent hold.
+	case !requestPermanent && active && !oldUntil.Before(until):
+		// An active timed (or fail-closed) hold whose expiry already equals
+		// or outlives the request: identical repeat or weaker request,
+		// nothing to write. An inactive record (expired/absent) never lands
+		// here, so a valid future request over one places a fresh hold.
 	case requestPermanent:
+		// Strengthen an existing timed/absent/expired hold to permanent.
+		prevPerm, prevUntil, prevReleased := mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased
 		mv.RetainPermanent = true
 		mv.RetainUntil = ""
-		changed = true
-	case active && oldUntil.After(until):
-		// Existing timed hold already outlives the request: keep it.
-	default:
-		mv.RetainUntil = until.Format(time.RFC3339Nano)
-		changed = true
-	}
-	if changed {
-		prevPerm, prevUntil := mv.RetainPermanent, mv.RetainUntil
+		mv.RetainReleased = false
 		if err := s.manifest.commit(s.root); err != nil {
-			mv.RetainPermanent, mv.RetainUntil = prevPerm, prevUntil
+			mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased = prevPerm, prevUntil, prevReleased
+			return RetentionInfo{}, err
+		}
+	default:
+		// A timed request that genuinely extends the current hold, or that
+		// places the first hold (including over an expired record).
+		prevPerm, prevUntil, prevReleased := mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased
+		mv.RetainPermanent = false
+		mv.RetainUntil = until.Format(time.RFC3339Nano)
+		mv.RetainReleased = false
+		if err := s.manifest.commit(s.root); err != nil {
+			mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased = prevPerm, prevUntil, prevReleased
 			return RetentionInfo{}, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return retentionInfo(name, mv, now), err
 	}
-	_ = active
 	return retentionInfo(name, mv, now), nil
 }
 
-// ReleaseRetention explicitly removes a retention hold, timed or
-// permanent, including one that has not expired. Releasing a version that
-// has no hold (or whose hold already expired) is a side-effect-free no-op.
-// The release is durable only after the manifest commit, so a crash before
-// that point leaves the protection fully in place.
+// ReleaseRetention explicitly removes an *active* retention hold, timed
+// or permanent, including one that has not expired. Releasing a version
+// that has no active hold (never held, or a timed hold that already
+// expired) is a side-effect-free no-op that leaves the natural-expiry
+// evidence untouched; only an explicit early release is marked as such
+// (retain_released) so watermark reclaim can order released data ahead
+// of naturally expired data. The release is durable only after the
+// manifest commit, so a crash before that point leaves the protection
+// fully in place.
 func (s *Store) ReleaseRetention(ctx context.Context, name string, version int64) (RetentionInfo, error) {
 	if err := validateName(name); err != nil {
 		return RetentionInfo{}, err
@@ -103,12 +117,17 @@ func (s *Store) ReleaseRetention(ctx context.Context, name string, version int64
 	}
 
 	now := s.now()
-	if mv.RetainPermanent || mv.RetainUntil != "" {
-		prevPerm, prevUntil := mv.RetainPermanent, mv.RetainUntil
+	// Only an *active* hold counts as an explicit early release. Releasing a
+	// hold that already expired (or that never existed) is a side-effect-free
+	// no-op that preserves the natural-expiry evidence used by watermark
+	// reclaim ordering.
+	if active, _, _ := holdStateLocked(mv, now); active {
+		prevPerm, prevUntil, prevReleased := mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased
 		mv.RetainPermanent = false
 		mv.RetainUntil = ""
+		mv.RetainReleased = true
 		if err := s.manifest.commit(s.root); err != nil {
-			mv.RetainPermanent, mv.RetainUntil = prevPerm, prevUntil
+			mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased = prevPerm, prevUntil, prevReleased
 			return RetentionInfo{}, err
 		}
 	}

@@ -151,7 +151,9 @@ func (s *Store) toInfo(name string, mv *metaVersion) VersionInfo {
 //
 //	unknown name / unknown version -> ErrNotFound
 //	StateCollected                 -> ErrCollected
-//	StateDeleted                   -> ErrDeleted
+//	StateDeleted + active hold     -> ErrDeletedRetained (matches both
+//	                                  ErrDeleted and ErrRetained via errors.Is)
+//	StateDeleted otherwise         -> ErrDeleted
 //
 // Callers must hold s.mu.
 func (s *Store) lookupVersion(name string, version int64) (*objectMeta, *metaVersion, error) {
@@ -167,6 +169,9 @@ func (s *Store) lookupVersion(name string, version int64) (*objectMeta, *metaVer
 	case StateCollected:
 		return obj, mv, fmt.Errorf("%w: %s v%d", ErrCollected, name, version)
 	case StateDeleted:
+		if active, _, _ := holdStateLocked(mv, s.now()); active {
+			return obj, mv, fmt.Errorf("%w: %s v%d", ErrDeletedRetained, name, version)
+		}
 		return obj, mv, fmt.Errorf("%w: %s v%d", ErrDeleted, name, version)
 	}
 	return obj, mv, nil
@@ -272,7 +277,10 @@ func (s *Store) openVerified(mv *metaVersion) (io.ReadCloser, error) {
 }
 
 // Get reads the current live version of name. It returns ErrNotFound,
-// ErrDeleted or ErrCollected to distinguish why the data is unavailable.
+// ErrDeleted, ErrDeletedRetained or ErrCollected to distinguish why the
+// data is unavailable. ErrDeletedRetained (which also matches both
+// ErrDeleted and ErrRetained via errors.Is) applies to an object that is
+// soft-deleted while its latest version is still inside an active hold.
 func (s *Store) Get(ctx context.Context, name string) (io.ReadCloser, VersionInfo, error) {
 	if err := validateName(name); err != nil {
 		return nil, VersionInfo{}, err
@@ -317,6 +325,9 @@ func (s *Store) lookupCurrentLocked(name string) (*objectMeta, *metaVersion, err
 		case mv.State == StateCollected:
 			return obj, mv, fmt.Errorf("%w: %s", ErrCollected, name)
 		default:
+			if active, _, _ := holdStateLocked(mv, s.now()); active {
+				return obj, mv, fmt.Errorf("%w: %s", ErrDeletedRetained, name)
+			}
 			return obj, mv, fmt.Errorf("%w: %s", ErrDeleted, name)
 		}
 	}
@@ -552,16 +563,17 @@ func (s *Store) PurgeVersion(ctx context.Context, name string, version int64) (V
 	}
 	digest := mv.Digest
 	prevState := mv.State
-	prevPerm, prevUntil := mv.RetainPermanent, mv.RetainUntil
+	prevPerm, prevUntil, prevReleased := mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased
 	mv.State = StateCollected
 	mv.PurgedAt = nowUTC()
 	// Collected data has no bytes and therefore no hold to keep.
 	mv.RetainPermanent = false
 	mv.RetainUntil = ""
+	mv.RetainReleased = false
 	if err := s.manifest.commit(s.root); err != nil {
 		mv.State = prevState
 		mv.PurgedAt = ""
-		mv.RetainPermanent, mv.RetainUntil = prevPerm, prevUntil
+		mv.RetainPermanent, mv.RetainUntil, mv.RetainReleased = prevPerm, prevUntil, prevReleased
 		return VersionInfo{}, err
 	}
 	if !s.digestReferencedLocked(digest, func(v *metaVersion) bool {

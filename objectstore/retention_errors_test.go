@@ -75,7 +75,13 @@ func TestReadRejectionReasonsStayDistinct(t *testing.T) {
 	if _, _, gerr := s.GetVersion(ctx, "h", hd.Version); !errors.Is(gerr, ErrDeleted) {
 		t.Fatalf("held deleted read must stay ErrDeleted: got %v", gerr)
 	}
-	t.Logf("judgment: held+deleted survives sweep; read -> ErrDeleted (not Collected/NotFound)")
+	// New distinction: the held+deleted combination is also identifiable
+	// precisely (and matches ErrRetained), without breaking ErrDeleted.
+	if _, _, gerr := s.GetVersion(ctx, "h", hd.Version); !errors.Is(gerr, ErrDeletedRetained) ||
+		!errors.Is(gerr, ErrRetained) {
+		t.Fatalf("held deleted read must also match ErrDeletedRetained/ErrRetained: got %v", gerr)
+	}
+	t.Logf("judgment: held+deleted survives sweep; read -> ErrDeletedRetained (also ErrDeleted)")
 
 	// 5. Release + sweep collects it; read now explicitly ErrCollected.
 	if _, err := s.ReleaseRetention(ctx, "h", hd.Version); err != nil {
